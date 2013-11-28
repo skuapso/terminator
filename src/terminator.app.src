@@ -1,0 +1,17 @@
+{application, terminator,
+ [
+  {description, "connections terminator"},
+  {vsn, git},
+  {registered, [terminator_sup, terminator]},
+  {applications, [
+                  kernel,
+                  stdlib,
+                  logger,
+                  hooks
+                 ]},
+  {mod, {terminator, []}},
+  {env, [
+    {listen, []},
+    {weight, -1}
+  ]}
+ ]}.
