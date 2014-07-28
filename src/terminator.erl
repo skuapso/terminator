@@ -4,16 +4,14 @@
 -behaviour(supervisor).
 
 %% API
--export([
-    start_link/1,
-    listen/1,
-    accept/2,
-    add_uin/2,
-    add_terminal/4,
-    terminal_command/5,
-    delete_terminal/3,
-    init_terminator/2
-  ]).
+-export([start_link/1]).
+-export([listen/1]).
+-export([accept/2]).
+-export([add_uin/2]).
+-export([add_terminal/3]).
+-export([terminal_command/4]).
+-export([delete_terminal/3]).
+-export([init_terminator/2]).
 
 -export([behaviour_info/1]).
 
@@ -75,8 +73,7 @@ start(_StartType, StartArgs) ->
 stop(_State) ->
   ok.
 
-add_terminal(Pid, Module, UIN, _Timeout) ->
-  Terminal = {Module, UIN},
+add_terminal(Pid, Terminal, _Timeout) ->
   case ets:match(?MODULE, {'$1', Terminal}) of
     [] -> ok;
     L -> lists:map(fun(X) ->
@@ -87,8 +84,8 @@ add_terminal(Pid, Module, UIN, _Timeout) ->
   ets:insert(?MODULE, {Pid, Terminal}),
   ok.
 
-terminal_command(_Pid, Module, UIN, _RawData, _Timeout) ->
-  Terminal = {Module, UIN},
+terminal_command(_Pid, Terminal, _RawData, _Timeout) ->
+%  Terminal = {Module, UIN},
   case hooks:run(get, [terminal, command, Terminal]) of
     [] -> ok;
     [{Recipient, {CommandId, Command, _SendType}} | _] ->
@@ -115,9 +112,9 @@ init_terminator(Module, Socket) ->
 init(Opts) ->
   ets:new(?MODULE, [set, public, named_table]),
   Weight = misc:get_env(?MODULE, weight, Opts),
-  hooks:install(terminal_uin, Weight, fun ?MODULE:add_terminal/4),
-  hooks:install(terminal_raw_data, Weight, fun ?MODULE:terminal_command/5),
-  hooks:install(connection_closed, Weight, fun ?MODULE:delete_terminal/3),
+  hooks:install(terminal_uin, Weight, {?MODULE, add_terminal}),
+  hooks:install(terminal_raw_data, Weight, {?MODULE, terminal_command}),
+  hooks:install(connection_closed, Weight, {?MODULE, delete_terminal}),
   {ok,
     {
       {one_for_one, 5, 10},
