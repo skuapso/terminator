@@ -85,10 +85,10 @@ add_terminal(Pid, Terminal, _Timeout) ->
   ok.
 
 terminal_command(_Pid, Terminal, _RawData, _Timeout) ->
-%  Terminal = {Module, UIN},
   case hooks:run(get, [terminal, command, Terminal]) of
     [] -> ok;
     [{Recipient, {CommandId, Command, _SendType}} | _] ->
+      debug("setting exec to command ~w", [CommandId]),
       hooks:run({Recipient, set}, [terminal, command_exec, {Terminal, CommandId}]),
       {ok, {command, {answer, Command}}}
   end.
