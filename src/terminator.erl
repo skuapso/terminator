@@ -6,12 +6,12 @@
 %% API
 -export([start_link/1]).
 -export([listen/1]).
--export([accept/2]).
+-export([accept/3]).
 -export([add_uin/2]).
 -export([add_terminal/3]).
 -export([terminal_command/4]).
 -export([delete_terminal/3]).
--export([init_terminator/2]).
+-export([init_terminator/3]).
 
 -export([behaviour_info/1]).
 
@@ -34,21 +34,23 @@ add_uin(Parsed, UIN) ->
   end.
 
 behaviour_info(callbacks) ->
-  [
-    {accept, 1},
-    {close, 1},
-    {enter_loop, 1}
-  ].
+  [{accept, 1},
+   {close, 1},
+   {init, 1}
+   | gen_server:behaviour_info(callbacks)].
 
 listen({Type, Module, Port}) ->
-  listen({Type, Module, Port, {0, 0, 0, 0}});
-listen({Type, _Module, _Port, _Ip} = Opts) ->
-  Terminator = list_to_atom(atom_to_list(Type) ++ "_terminator"),
+  listen({Type, Module, Port, []});
+listen({Type, Module, Port, Opts}) ->
+  Ip = proplists:get_value(ip, Opts, {0, 0, 0, 0}),
+  listen({Type, Module, Port, Ip, proplists:delete(ip, Opts)});
+listen(Opts) when tuple_size(Opts) =:= 5 ->
+  Terminator = list_to_atom(atom_to_list(element(1, Opts)) ++ "_terminator"),
   supervisor:start_child(?MODULE, listener(Terminator, Opts)).
 
-accept(Module, Socket) when is_port(Socket) ->
+accept(Module, Socket, Opts) when is_port(Socket) ->
   trace("starting ~p terminator", [Module]),
-  {ok, Pid} = Reply = proc_lib:start_link(?MODULE, init_terminator, [Module, Socket]),
+  {ok, Pid} = Reply = proc_lib:start_link(?MODULE, init_terminator, [Module, Socket, Opts]),
   debug("accepted by ~w", [Pid]),
   trace("setting controlling process"),
   gen_tcp:controlling_process(Socket, Pid),
@@ -97,14 +99,14 @@ delete_terminal(Pid, _Reason, _Timeout) ->
   ets:delete(?MODULE, Pid),
   ok.
 
-init_terminator(Module, Socket) ->
+init_terminator(Module, Socket, Opts) ->
   trace("init ~w", [Module]),
   proc_lib:init_ack({ok, self()}),
   hooks:run(connection_accepted, [Module, Socket], 10000),
   hooks:final(connection_closed),
   ets:insert(?MODULE, {self(), undefined}),
   process_flag(trap_exit, true),
-  Module:enter_loop(Socket).
+  Module:init({Socket, Opts}).
 
 %% ===================================================================
 %% Supervisor callbacks
@@ -126,7 +128,7 @@ init(Opts) ->
 %% ===================================================================
 %% Internal functions
 %% ===================================================================
-listener(Module, {_Type, _HandlerModule, Port, Ip} = Opts) ->
+listener(Module, {_Type, _HandlerModule, Port, Ip, _} = Opts) ->
   {
     {Module, Port, Ip},
     {Module, start_link, [Opts]},

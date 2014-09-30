@@ -25,7 +25,7 @@
     code_change/3
   ]).
 
--record(state, {socket, module}).
+-record(state, {socket, module, options = []}).
 
 -include_lib("logger/include/log.hrl").
 
@@ -44,7 +44,6 @@
 start_link(Opts) ->
   gen_server:start_link(?MODULE, Opts, []).
 
-
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -60,12 +59,12 @@ start_link(Opts) ->
 %%                     {stop, Reason}
 %% @end
 %%--------------------------------------------------------------------
-init({tcp, Module, Port, Ip}) ->
-  notice("listening ~w ~w (~w)", [Ip, Port, Module]),
+init({tcp, Module, Port, Ip, Opts}) ->
+  notice("listening ~w ~w ~w", [Ip, Port, {Module, Opts}]),
   process_flag(trap_exit, true),
   {ok, Socket} = gen_tcp:listen(Port, [{ip, Ip} | ?TCP_OPTIONS]),
   {ok, _Ref} = prim_inet:async_accept(Socket, -1),
-  {ok, #state{socket = Socket, module = Module}}.
+  {ok, #state{socket = Socket, module = Module, options = Opts}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -110,11 +109,14 @@ handle_cast(Msg, State) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_info({inet_async, ListenSocket, _Ref, {ok, ClientSocket}}, #state{socket = ListenSocket, module = Module} = S) ->
+handle_info({inet_async, ListenSocket, _Ref, {ok, ClientSocket}},
+            #state{socket = ListenSocket,
+                   options = Opts,
+                   module = Module} = S) ->
   trace("new connection"),
   inet_db:register_socket(ClientSocket, inet_tcp),
   debug("socket info: ~w", [inet_db:lookup_socket(ClientSocket)]),
-  {ok, _Pid} = terminator:accept(Module, ClientSocket),
+  {ok, _Pid} = terminator:accept(Module, ClientSocket, Opts),
   {ok, _NewRef} = prim_inet:async_accept(ListenSocket, -1),
   {noreply, S};
 handle_info({'EXIT', _Pid, Reason}, S) ->
