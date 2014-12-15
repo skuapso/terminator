@@ -38,7 +38,7 @@
 %% @doc
 %% Starts the server
 %%
-%% @spec start_link() -> {ok, Pid} | ignore | {error, Error}
+%% @spec start_link() -> {ok, Pid} | ignore | {'_err'or, Error}
 %% @end
 %%--------------------------------------------------------------------
 start_link(Opts) ->
@@ -60,7 +60,7 @@ start_link(Opts) ->
 %% @end
 %%--------------------------------------------------------------------
 init({tcp, Module, Port, Ip, Opts}) ->
-  notice("listening ~w ~w ~w", [Ip, Port, {Module, Opts}]),
+  '_notice'("listening ~w ~w ~w", [Ip, Port, {Module, Opts}]),
   process_flag(trap_exit, true),
   {ok, Socket} = gen_tcp:listen(Port, [{ip, Ip} | ?TCP_OPTIONS]),
   {ok, _Ref} = prim_inet:async_accept(Socket, -1),
@@ -81,7 +81,7 @@ init({tcp, Module, Port, Ip, Opts}) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_call(Request, From, State) ->
-  warning("unhandled call ~w from ~w", [Request, From]),
+  '_warning'("unhandled call ~w from ~w", [Request, From]),
   Reply = ok,
   {reply, Reply, State}.
 
@@ -96,7 +96,7 @@ handle_call(Request, From, State) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_cast(Msg, State) ->
-  warning("unhandled cast ~w", [Msg]),
+  '_warning'("unhandled cast ~w", [Msg]),
   {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -113,17 +113,17 @@ handle_info({inet_async, ListenSocket, _Ref, {ok, ClientSocket}},
             #state{socket = ListenSocket,
                    options = Opts,
                    module = Module} = S) ->
-  trace("new connection"),
+  '_trace'("new connection"),
   inet_db:register_socket(ClientSocket, inet_tcp),
-  debug("socket info: ~w", [inet_db:lookup_socket(ClientSocket)]),
-  {ok, _Pid} = terminator:accept(Module, ClientSocket, Opts),
+  '_debug'("socket '_info': ~w", [inet_db:lookup_socket(ClientSocket)]),
+  {ok, _Pid} = terminator:accept({tcp, ClientSocket}, {Module, Opts}),
   {ok, _NewRef} = prim_inet:async_accept(ListenSocket, -1),
   {noreply, S};
 handle_info({'EXIT', _Pid, Reason}, S) ->
-  debug("connection closed ~w", [Reason]),
+  '_debug'("connection closed ~w", [Reason]),
   {noreply, S};
 handle_info(Info, State) ->
-  warning("unhandled info ~w", [Info]),
+  '_warning'("unhandled '_info' ~w", [Info]),
   {noreply, State}.
 
 %%--------------------------------------------------------------------
