@@ -36,6 +36,7 @@
                 socket,
                 module,
                 answer,
+                active = false,
                 timeout = 30000,
                 sockopts = #{active => true,
                              mode => binary,
@@ -104,6 +105,7 @@ set(State = #state{}, answer, Answer) -> State#state{answer = Answer};
 set(State = #state{}, uin,    Uin)    -> State#state{uin    = Uin};
 set(State = #state{}, sockopts, Opts) -> State#state{sockopts = Opts};
 set(State = #state{}, timeout,Timeout)-> State#state{timeout= Timeout};
+set(State = #state{}, active, Active) -> State#state{active = Active};
 set(State = #state{}, module, Module) -> State#state{module = Module};
 set(State = #state{}, out,    Out)    -> State#state{out    = Out};
 set(State = #state{}, in,     In)     -> State#state{in     = In}.
@@ -262,7 +264,7 @@ handle_info(_Info, State) ->
 %% @spec terminate(Reason, State) -> void()
 %% @end
 %%--------------------------------------------------------------------
-terminate({broken, Data, Reason}, State) ->
+terminate({broken, Data, _Reason}, State) ->
   terminate({broken, Data}, State);
 terminate(Reason, State) ->
   '_debug'("connection closed"),
@@ -291,9 +293,11 @@ set_control({tcp, Socket}, Pid) ->
 set_socket_opts({tcp, Socket}, #state{sockopts = Opts}) ->
   inet:setopts(Socket, maps:to_list(Opts)).
 
-send({tcp, Socket}, Data, State) ->
+send(Data, #state{socket = {tcp, Socket}} = State) when Data =/= <<>> ->
   Result = gen_tcp:send(Socket, Data),
-  {Result, State}.
+  {Result, State};
+send(<<>>, State) ->
+  {ok, State}.
 
 handle_parsed(<<>>, [Packet | Packets], State) ->
   '_trace'("packet ~w", [Packet]),
@@ -306,21 +310,21 @@ handle_parsed(RawData, Packets, State) when RawData =/= <<>> ->
   '_trace'("handling packets ~w", [Packets]),
   handle_parsed(<<>>, Packets, State1);
 
-handle_parsed(<<>>, [], #state{module = Module} = State) ->
-  '_trace'("getting answer from ~w", [Module]),
-  '_debug'("state is ~p", [State]),
+handle_parsed(<<>>, [], State) ->
+  handle_answer(State).
+
+handle_answer(#state{answer = {Module, Answer}, active = false} = State)
+  when is_binary(Answer) ->
+  State1 = run_hook(terminal_answer, [terminal(State), Module, Answer], State),
+  {ok, State2} = send(Answer, State1),
+  noreply(State2#state{answer = undefined});
+
+handle_answer(#state{module = Module} = State) ->
   {ok, Answer, State1} = case Module:answer(State) of
                            {ok, Answer_} -> {ok, Answer_, State};
                            Answer_ -> Answer_
                          end,
-  '_debug'("state is ~p", [State1]),
-  State2 = run_hook(terminal_answer, [terminal(State), Module, Answer], State1),
-  '_debug'("state is ~p", [State2]),
-  Socket = socket(State2),
-  '_debug'("socket is ~p", [Socket]),
-  {ok, State3} = send(Socket, element(2, Answer), State2),
-  '_debug'("state is ~p", [State3]),
-  noreply(State3#state{answer = undefined}).
+  handle_answer(State1#state{answer = Answer, active = false}).
 
 handle_incomplete(Data, State) ->
   '_debug'("incomplete ~w", [Data]),
