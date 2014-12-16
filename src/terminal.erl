@@ -22,6 +22,7 @@
 -export([uin/1]).
 -export([answer/1]).
 -export([timeout/1]).
+-export([active/1]).
 
 %% gen_server callbacks
 -export([init/1]).
@@ -43,6 +44,7 @@
                              buffer => 65535},
                 in = 65535,
                 out = 1400,
+                close = false,
                 incomplete = <<>>}).
 
 -define(socket(T, Sock, Socket),
@@ -90,6 +92,7 @@ state(#state{state = IState}, Module) ->
   maps:get(Module, IState, #{}).
 
 answer(#state{answer = Answer}) -> Answer.
+active(#state{active = Active}) -> Active.
 
 set(State = #state{state = IState}, Module, Key, Val) ->
   '_trace'("getting internal state for ~w from ~w", [Module, IState]),
@@ -102,6 +105,7 @@ set(State = #state{state = IState}, {module, Module}, MState) when is_map(IState
   NewIState = maps:put(Module, MState, IState),
   State#state{state = NewIState};
 set(State = #state{}, answer, Answer) -> State#state{answer = Answer};
+set(State = #state{}, close,  Close)  -> State#state{close  = Close};
 set(State = #state{}, uin,    Uin)    -> State#state{uin    = Uin};
 set(State = #state{}, sockopts, Opts) -> State#state{sockopts = Opts};
 set(State = #state{}, timeout,Timeout)-> State#state{timeout= Timeout};
@@ -145,7 +149,7 @@ init(Opts) ->
 %%--------------------------------------------------------------------
 handle_call(_Request, _From, State) ->
   '_warning'("unhandled call ~w from ~w", [_Request, _From]),
-  {noreply, State, State#state.timeout}.
+  return(State).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -161,10 +165,10 @@ handle_cast(accept, {Socket, {Module, Opts}}) ->
   '_trace'("accepting socket"),
   {ok, State} = Module:init(Opts, #state{socket = Socket, module = Module}),
   set_socket_opts(Socket, State),
-  noreply(State);
+  return(State);
 handle_cast(_Msg, State) ->
   '_warning'("unhandled cast ~w", [_Msg]),
-  noreply(State).
+  return(State).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -187,7 +191,7 @@ handle_info({T, Sock, SockData} = Msg, #state{socket = Socket,
     ->
   '_trace'("getting uin"),
   Data = <<Incomplete/binary, SockData/binary>>,
-  Reply = case Module:uin(Data, State) of
+  NewState = case Module:uin(Data, State) of
             {incomplete, #state{} = State1} ->
               handle_incomplete(Data, State1);
             {ok, Uin, #state{} = State1} ->
@@ -197,7 +201,7 @@ handle_info({T, Sock, SockData} = Msg, #state{socket = Socket,
             {ok, Uin} ->
               set_uin(Uin, Msg, State)
           end,
-  noreply(Reply);
+  return(NewState);
 handle_info({T, Sock, SockData}, #state{socket = Socket,
                                         in = In,
                                         module = Module,
@@ -208,7 +212,7 @@ handle_info({T, Sock, SockData}, #state{socket = Socket,
     ->
   '_trace'("parsing data"),
   Data = <<Incomplete/binary, SockData/binary>>,
-  Reply = case catch Module:parse(Data, State) of
+  NewState = case catch Module:parse(Data, State) of
             {incomplete, #state{} = State1} ->
               handle_incomplete(Data, State1);
 
@@ -236,22 +240,22 @@ handle_info({T, Sock, SockData}, #state{socket = Socket,
             {'EXIT', Reason} ->
               exit({broken, Data, Reason})
           end,
-  noreply(Reply);
+  return(NewState);
 handle_info({T, Sock, SockData}, #state{socket = Socket,
                                           incomplete = Incomplete} = State)
   when ?socket(T, Sock, Socket) ->
   '_warning'("recv buffer overflow"),
-  {stop, overflow, State#state{incomplete = <<Incomplete/binary, SockData/binary>>}};
+  return(State#state{incomplete = <<Incomplete/binary, SockData/binary>>, close = overflow});
 handle_info({tcp_closed, Sock}, #state{socket = Socket} = State)
   when ?socket(tcp, Sock, Socket) ->
   '_trace'("socket closed"),
-  {stop, normal, State};
+  return(State#state{close = normal});
 handle_info(timeout, State) ->
   '_trace'("timeout"),
-  {stop, normal, State};
+  return(State#state{close = normal});
 handle_info(_Info, State) ->
   '_warning'("unhandled '_info' msg ~w", [_Info]),
-  noreply(State).
+  return(State).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -317,14 +321,21 @@ handle_answer(#state{answer = {Module, Answer}, active = false} = State)
   when is_binary(Answer) ->
   State1 = run_hook(terminal_answer, [terminal(State), Module, Answer], State),
   {ok, State2} = send(Answer, State1),
-  noreply(State2#state{answer = undefined});
+  '_debug'("state after send ~w", [State2]),
+  State2;
 
 handle_answer(#state{module = Module} = State) ->
-  {ok, Answer, State1} = case Module:answer(State) of
-                           {ok, Answer_} -> {ok, Answer_, State};
-                           Answer_ -> Answer_
+  '_debug'("getting answer from ~w, state ~w", [Module, State]),
+  Answer = case Module:answer(State) of
+              {ok, A} -> {ok, A, State};
+              A -> A
+            end,
+  {ok, Answer1, State1} = case Answer of
+                           {ok, A1, State_} when is_binary(A1) ->
+                             {ok, {Module, A1}, State_};
+                           A1 -> A1
                          end,
-  handle_answer(State1#state{answer = Answer, active = false}).
+  handle_answer(State1#state{answer = Answer1, active = false}).
 
 handle_incomplete(Data, State) ->
   '_debug'("incomplete ~w", [Data]),
@@ -335,7 +346,11 @@ set_uin(Uin, Data, #state{socket = Socket, module = Module} = State) ->
   State1 = State#state{uin = Uin},
   State2 = run_hook(connection_accepted, [Module, element(2, Socket)], State1),
   State3 = run_hook(terminal_uin, [terminal(State1)], State2),
-  handle_info(Data, State3).
+  '_trace'("handling data with state ~p", [State3]),
+  case handle_info(Data, State3) of
+    {noreply, NewState, _} -> NewState;
+    {stop, _, NewState} -> NewState
+  end.
 
 run_hook(Hook, Data, #state{module = Module} = State) ->
   HooksData = hooks:run(Hook, Data, timeout(State)),
@@ -364,8 +379,8 @@ list_div(Fun, [E | List], Matched, NotMatched) ->
 list_div(_, [], Matched, NotMatched) ->
   {lists:reverse(Matched), lists:reverse(NotMatched)}.
 
-noreply(#state{} = State) -> {noreply, State, timeout(State)};
-noreply({noreply, State}) -> {noreply, State, timeout(State)};
-noreply({noreply, State, _Timeout}) -> {noreply, State, timeout(State)}.
+return(#state{close = false} = State) -> {noreply, State, timeout(State)};
+return(#state{close = Reason} = State) when Reason =/= false -> {stop, Reason, State};
+return(Reply) -> Reply.
 
 %% vim: ft=erlang
