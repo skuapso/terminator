@@ -349,7 +349,7 @@ handle_answer(#state{answer = {AnsModule, Answer}, module = Module, active = fal
   State1 = run_hook(terminal_answer, [terminal(State), AnsModule, BinAnswer], State),
   {ok, State2} = send(Answer, State1),
   '_debug'("state after send ~w", [State2]),
-  State2;
+  State2#state{answer = undefined};
 
 handle_answer(#state{module = Module, answer = PrevAnswer} = State) ->
   '_debug'("getting answer from ~w, state ~w, prev answer is ~w", [Module, State, PrevAnswer]),
