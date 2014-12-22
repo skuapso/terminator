@@ -70,7 +70,8 @@ behaviour_info(callbacks) ->
    {uin, 2},
    {parse, 2},
    {answer, 1},
-   {handle_hooks, 4}
+   {handle_hooks, 4},
+   {handle_info, 2}
   ].
 
 accept(Socket, Module) ->
@@ -95,7 +96,6 @@ answer(#state{answer = Answer}) -> Answer.
 active(#state{active = Active}) -> Active.
 
 set(State = #state{state = IState}, Module, Key, Val) ->
-  '_trace'("getting internal state for ~w from ~w", [Module, IState]),
   MState = maps:get(Module, IState, #{}),
   NewMState = maps:put(Key, Val, MState),
   NewIState = maps:put(Module, NewMState, IState),
@@ -105,6 +105,7 @@ set(State = #state{state = IState}, {module, Module}, MState) when is_map(IState
   NewIState = maps:put(Module, MState, IState),
   State#state{state = NewIState};
 set(State = #state{}, answer, Answer) -> State#state{answer = Answer};
+set(State = #state{}, socket, Socket) -> State#state{socket = Socket};
 set(State = #state{}, close,  Close)  -> State#state{close  = Close};
 set(State = #state{}, uin,    Uin)    -> State#state{uin    = Uin};
 set(State = #state{}, sockopts, Opts) -> State#state{sockopts = Opts};
@@ -131,6 +132,7 @@ set(State = #state{}, in,     In)     -> State#state{in     = In}.
 %%--------------------------------------------------------------------
 init(Opts) ->
   '_trace'("init"),
+  process_flag(trap_exit, true),
   {ok, Opts, 30000}.
 
 %%--------------------------------------------------------------------
@@ -181,61 +183,53 @@ handle_cast(_Msg, State) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_info({T, Sock, SockData} = Msg, #state{socket = Socket,
-                                        in = In,
                                         uin = undefined,
                                         module = Module,
                                         incomplete = Incomplete} = State)
-  when
-    ?socket(T, Sock, Socket)
-    andalso (byte_size(Incomplete) + byte_size(SockData)) =< In
-    ->
+  when ?socket(T, Sock, Socket) ->
   '_trace'("getting uin"),
-  Data = <<Incomplete/binary, SockData/binary>>,
-  NewState = case Module:uin(Data, State) of
-            {incomplete, #state{} = State1} ->
-              handle_incomplete(Data, State1);
-            {ok, Uin, #state{} = State1} ->
-              set_uin(Uin, Msg, State1);
+  {Data, State1} = merge_data(SockData, Incomplete, State),
+  NewState = case Module:uin(Data, State1) of
+            {incomplete, #state{} = State2} ->
+              handle_incomplete(Data, State2);
+            {ok, Uin, #state{} = State2} ->
+              set_uin(Uin, Msg, State2);
             incomplete ->
-              handle_incomplete(Data, State);
+              handle_incomplete(Data, State1);
             {ok, Uin} ->
-              set_uin(Uin, Msg, State)
+              set_uin(Uin, Msg, State1)
           end,
   return(NewState);
 handle_info({T, Sock, SockData}, #state{socket = Socket,
-                                        in = In,
                                         module = Module,
                                         incomplete = Incomplete} = State)
-  when
-    ?socket(T, Sock, Socket)
-    andalso (byte_size(Incomplete) + byte_size(SockData)) =< In
-    ->
+  when ?socket(T, Sock, Socket) ->
   '_trace'("parsing data"),
-  Data = <<Incomplete/binary, SockData/binary>>,
-  NewState = case catch Module:parse(Data, State) of
-            {incomplete, #state{} = State1} ->
-              handle_incomplete(Data, State1);
+  {Data, State1} = merge_data(SockData, Incomplete, State),
+  NewState = case catch Module:parse(Data, State1) of
+            {incomplete, #state{} = State2} ->
+              handle_incomplete(Data, State2);
 
-            {ok, Packets, #state{} = State1} ->
-              handle_parsed(Data, Packets, State1);
+            {ok, Packets, #state{} = State2} ->
+              handle_parsed(Data, Packets, State2);
 
-            {ok, RawParsed, Packets, #state{} = State1} ->
-              handle_parsed(RawParsed, Packets, State1);
+            {ok, RawParsed, Packets, #state{} = State2} ->
+              handle_parsed(RawParsed, Packets, State2);
 
-            {ok, RawParsed, Packets, Incomplete, #state{} = State1} ->
-              handle_parsed(RawParsed, Packets, handle_incomplete(Incomplete, State1));
+            {ok, RawParsed, Packets, Incomplete, #state{} = State2} ->
+              handle_parsed(RawParsed, Packets, handle_incomplete(Incomplete, State2));
 
             incomplete ->
-              handle_incomplete(Data, State);
+              handle_incomplete(Data, State1);
 
             {ok, Packets} ->
-              handle_parsed(Data, Packets, State);
+              handle_parsed(Data, Packets, State1);
 
             {ok, RawParsed, Packets} ->
-              handle_parsed(RawParsed, Packets, State);
+              handle_parsed(RawParsed, Packets, State1);
 
             {ok, RawParsed, Packets, Incomplete} ->
-              handle_parsed(RawParsed, Packets, handle_incomplete(Incomplete, State));
+              handle_parsed(RawParsed, Packets, handle_incomplete(Incomplete, State1));
 
             {'EXIT', Reason} ->
               exit({broken, Data, Reason})
@@ -253,9 +247,11 @@ handle_info({tcp_closed, Sock}, #state{socket = Socket} = State)
 handle_info(timeout, State) ->
   '_trace'("timeout"),
   return(State#state{close = normal});
-handle_info(_Info, State) ->
-  '_warning'("unhandled '_info' msg ~w", [_Info]),
-  return(State).
+handle_info(Info, #state{module = Module} = State) ->
+  NewState = case Module:handle_info(Info, State) of
+               {ok, State1} -> State1
+             end,
+  return(NewState).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -290,42 +286,73 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+merge_data(SockData, Incomplete, #state{in = In} = State) ->
+  case is_binary(SockData) of
+    true when byte_size(Incomplete) + byte_size(SockData) > In ->
+      {<<>>, State#state{close = overflow}};
+    true ->
+      {<<Incomplete/binary, SockData/binary>>, State};
+    false ->
+      {SockData, State}
+  end.
+
 set_control({tcp, Socket}, Pid) ->
   gen_tcp:controlling_process(Socket, Pid),
   gen_server:cast(Pid, accept).
 
 set_socket_opts({tcp, Socket}, #state{sockopts = Opts}) ->
-  inet:setopts(Socket, maps:to_list(Opts)).
+  inet:setopts(Socket, maps:to_list(Opts));
+set_socket_opts(_Socket, #state{module = Module} = State) ->
+  Module:setopts(State).
 
 send(Data, #state{socket = {tcp, Socket}} = State) when Data =/= <<>> ->
   Result = gen_tcp:send(Socket, Data),
   {Result, State};
-send(<<>>, State) ->
-  {ok, State}.
+send(<<>>, #state{socket = {tcp, _Socket}} = State) ->
+  {ok, State};
+send(Data, #state{module = Module} = State) ->
+  Module:send(Data, State).
 
 handle_parsed(<<>>, [Packet | Packets], State) ->
   '_trace'("packet ~w", [Packet]),
   State1 = run_hook(terminal_packet, [terminal(State), Packet], State),
   handle_parsed(<<>>, Packets, State1);
 
-handle_parsed(RawData, Packets, State) when RawData =/= <<>> ->
+handle_parsed(RawData, Packets, State)
+  when
+    RawData =/= <<>>
+    andalso is_binary(RawData) ->
   '_trace'("raw ~w", [RawData]),
   State1 = run_hook(terminal_raw_data, [terminal(State), RawData], State),
   '_trace'("handling packets ~w", [Packets]),
   handle_parsed(<<>>, Packets, State1);
 
+handle_parsed(RawData, Packets, #state{module = Module} = State)
+  when RawData =/= <<>> ->
+  '_trace'("getting binary data representation"),
+  case Module:to_binary(raw, RawData) of
+    {ok, Data} -> handle_parsed(Data, Packets, State)
+  end;
+
 handle_parsed(<<>>, [], State) ->
   handle_answer(State).
 
-handle_answer(#state{answer = {Module, Answer}, active = false} = State)
-  when is_binary(Answer) ->
-  State1 = run_hook(terminal_answer, [terminal(State), Module, Answer], State),
+handle_answer(#state{answer = {AnsModule, Answer}, module = Module, active = false} = State)
+  when
+    is_binary(Answer)
+    orelse (AnsModule =:= Module)
+    ->
+  BinAnswer = case is_binary(Answer) of
+                true -> Answer;
+                false -> Module:to_binary(answer, Answer)
+              end,
+  State1 = run_hook(terminal_answer, [terminal(State), AnsModule, BinAnswer], State),
   {ok, State2} = send(Answer, State1),
   '_debug'("state after send ~w", [State2]),
   State2;
 
-handle_answer(#state{module = Module} = State) ->
-  '_debug'("getting answer from ~w, state ~w", [Module, State]),
+handle_answer(#state{module = Module, answer = PrevAnswer} = State) ->
+  '_debug'("getting answer from ~w, state ~w, prev answer is ~w", [Module, State, PrevAnswer]),
   Answer = case Module:answer(State) of
               {ok, A} -> {ok, A, State};
               A -> A
@@ -356,8 +383,10 @@ run_hook(Hook, Data, #state{module = Module} = State) ->
   HooksData = hooks:run(Hook, Data, timeout(State)),
   {HooksData1, State1} = handle_hooks(Hook, HooksData, State),
   '_trace'("handling hooks for ~p in ~p", [Hook, Module]),
-  {ok, State2} = Module:handle_hooks(Hook, Data, HooksData1, State1),
-  State2.
+  case Module:handle_hooks(Hook, Data, HooksData1, State1) of
+    ok -> State1;
+    {ok, State2} -> State2
+  end.
 
 handle_hooks(terminal_raw_data, HooksData, State) when is_list(HooksData) ->
   case list_div(fun({_, {answer, _}}) -> true; (_) -> false end, HooksData) of
@@ -379,8 +408,14 @@ list_div(Fun, [E | List], Matched, NotMatched) ->
 list_div(_, [], Matched, NotMatched) ->
   {lists:reverse(Matched), lists:reverse(NotMatched)}.
 
-return(#state{close = false} = State) -> {noreply, State, timeout(State)};
-return(#state{close = Reason} = State) when Reason =/= false -> {stop, Reason, State};
-return(Reply) -> Reply.
+return(#state{close = false} = State) ->
+  '_trace'("new state ~p", [State]),
+  {noreply, State, timeout(State)};
+return(#state{close = Reason} = State) when Reason =/= false ->
+  '_trace'("stop request"),
+  {stop, Reason, State};
+return(Reply) ->
+  '_warning'("self reply ~p", [Reply]),
+  Reply.
 
 %% vim: ft=erlang
