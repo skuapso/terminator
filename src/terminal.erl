@@ -50,9 +50,15 @@
                 commands = [],
                 incomplete = <<>>}).
 
--define(socket(T, Sock, Socket),
+-define(is_socket(T, Sock, Socket),
         element(1, Socket) =:= T
         andalso element(2, Socket) =:= Sock
+       ).
+
+-define(is_answer(T),
+        is_tuple(T)
+        andalso is_atom(element(1, T))
+        andalso is_binary(element(2, T))
        ).
 
 -include_lib("logger/include/log.hrl").
@@ -194,7 +200,7 @@ handle_info({T, Sock, SockData} = Msg, #state{socket = Socket,
                                         uin = undefined,
                                         module = Module,
                                         incomplete = Incomplete} = State)
-  when ?socket(T, Sock, Socket) ->
+  when ?is_socket(T, Sock, Socket) ->
   '_trace'("getting uin"),
   {Data, State1} = merge_data(SockData, Incomplete, State),
   NewState = case Module:uin(Data, State1) of
@@ -211,7 +217,7 @@ handle_info({T, Sock, SockData} = Msg, #state{socket = Socket,
 handle_info({T, Sock, SockData}, #state{socket = Socket,
                                         module = Module,
                                         incomplete = Incomplete} = State)
-  when ?socket(T, Sock, Socket) ->
+  when ?is_socket(T, Sock, Socket) ->
   '_trace'("parsing data"),
   {Data, State1} = merge_data(SockData, Incomplete, State),
   NewState = case catch Module:parse(Data, State1) of
@@ -245,11 +251,11 @@ handle_info({T, Sock, SockData}, #state{socket = Socket,
   return(NewState);
 handle_info({T, Sock, SockData}, #state{socket = Socket,
                                           incomplete = Incomplete} = State)
-  when ?socket(T, Sock, Socket) ->
+  when ?is_socket(T, Sock, Socket) ->
   '_warning'("recv buffer overflow"),
   return(State#state{incomplete = <<Incomplete/binary, SockData/binary>>, close = overflow});
 handle_info({tcp_closed, Sock}, #state{socket = Socket} = State)
-  when ?socket(tcp, Sock, Socket) ->
+  when ?is_socket(tcp, Sock, Socket) ->
   '_trace'("socket closed"),
   return(State#state{close = normal});
 handle_info(timeout, State) ->
@@ -363,9 +369,10 @@ handle_answer(#state{answer = {AnsModule, Answer}, module = Module,
 handle_answer(#state{module = Module, answer = PrevAnswer, commands = Cmds} = State) ->
   '_debug'("getting answer from ~w, state ~w, prev answer is ~w", [Module, State, PrevAnswer]),
   {ok, Answer, NewState} = case Module:answer(State) of
-                             {ok, A} when not is_tuple(A) ->
+                             {ok, A}
+                               when not (?is_answer(A))->
                                {ok, {Module, A}, State};
-                             {ok, A, #state{} = NState} when not is_tuple(A) ->
+                             {ok, A, #state{} = NState} when not (?is_answer(A)) ->
                                {ok, {Module, A}, NState};
                              A -> A
                            end,
