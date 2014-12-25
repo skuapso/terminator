@@ -17,6 +17,8 @@
 -export([set/4]).
 -export([state/2]).
 -export([socket/1]).
+-export([command/1]).
+-export([commands/1]).
 -export([sockopts/1]).
 -export([terminal/1]).
 -export([uin/1]).
@@ -45,6 +47,7 @@
                 in = 65535,
                 out = 1400,
                 close = false,
+                commands = [],
                 incomplete = <<>>}).
 
 -define(socket(T, Sock, Socket),
@@ -89,6 +92,10 @@ uin(#state{uin = Uin}) -> Uin.
 
 timeout(#state{timeout = Timeout}) -> Timeout.
 
+command({_Recipient, {_Id, Cmd}}) -> Cmd.
+
+commands(#state{commands = Commands}) -> Commands.
+
 state(#state{state = IState}, Module) ->
   maps:get(Module, IState, #{}).
 
@@ -105,6 +112,7 @@ set(State = #state{state = IState}, {module, Module}, MState) when is_map(IState
   NewIState = maps:put(Module, MState, IState),
   State#state{state = NewIState};
 set(State = #state{}, answer, Answer) -> State#state{answer = Answer};
+set(State = #state{}, commands, Cmds) -> State#state{commands=Cmds};
 set(State = #state{}, socket, Socket) -> State#state{socket = Socket};
 set(State = #state{}, close,  Close)  -> State#state{close  = Close};
 set(State = #state{}, uin,    Uin)    -> State#state{uin    = Uin};
@@ -337,21 +345,22 @@ handle_parsed(RawData, Packets, #state{module = Module} = State)
 handle_parsed(<<>>, [], State) ->
   handle_answer(State).
 
-handle_answer(#state{answer = {AnsModule, Answer}, module = Module, active = false} = State)
+handle_answer(#state{answer = {AnsModule, Answer}, module = Module,
+                     active = false, commands = []} = State)
   when
     is_binary(Answer)
     orelse (AnsModule =:= Module)
     ->
   {ok, BinAnswer} = case is_binary(Answer) of
-                true -> {ok, Answer};
-                false -> Module:to_binary(answer, Answer)
-              end,
+                      true -> {ok, Answer};
+                      false -> Module:to_binary(answer, Answer)
+                    end,
   State1 = run_hook(terminal_answer, [terminal(State), AnsModule, BinAnswer], State),
   {ok, State2} = send(Answer, State1),
   '_debug'("state after send ~w", [State2]),
   State2#state{answer = undefined};
 
-handle_answer(#state{module = Module, answer = PrevAnswer} = State) ->
+handle_answer(#state{module = Module, answer = PrevAnswer, commands = Cmds} = State) ->
   '_debug'("getting answer from ~w, state ~w, prev answer is ~w", [Module, State, PrevAnswer]),
   {ok, Answer, NewState} = case Module:answer(State) of
                              {ok, A} when not is_tuple(A) ->
@@ -360,6 +369,10 @@ handle_answer(#state{module = Module, answer = PrevAnswer} = State) ->
                                {ok, {Module, A}, NState};
                              A -> A
                            end,
+  #state{commands = NewCmds} = NewState,
+  RunnedCmds = Cmds -- NewCmds,
+  [hooks:run({Rec, set}, [terminal, command_exec, {terminal(NewState), Id}], timeout(NewState)) ||
+   {Rec, {Id, _Cmd}} <- RunnedCmds],
   handle_answer(NewState#state{answer = Answer, active = false}).
 
 handle_incomplete(Data, State) ->
@@ -379,31 +392,43 @@ set_uin(Uin, Data, #state{socket = Socket, module = Module} = State) ->
 
 run_hook(Hook, Data, #state{module = Module} = State) ->
   HooksData = hooks:run(Hook, Data, timeout(State)),
-  {HooksData1, State1} = handle_hooks(Hook, HooksData, State),
+  {HooksData1, State1} = handle_hooks([commands, answer], Hook, HooksData, State),
   '_trace'("handling hooks for ~p in ~p", [Hook, Module]),
   case Module:handle_hooks(Hook, Data, HooksData1, State1) of
     ok -> State1;
     {ok, State2} -> State2
   end.
 
-handle_hooks(terminal_raw_data, HooksData, State) when is_list(HooksData) ->
-  case list_div(fun({_, {answer, _}}) -> true; (_) -> false end, HooksData) of
-    {[], HooksData1} -> {HooksData1, State};
-    {[{Module, {answer, Answer}} | _], HooksData1} ->
-      {HooksData1, State#state{answer = {Module, Answer}}}
-  end;
-handle_hooks(_Hook, Answers, State) ->
+handle_hooks([commands | T], Hook, HooksData, #state{commands = Cmds} = State) ->
+  {CmdAnsw, Unhandled} = list_split(fun({_, {command, _}}) -> true; (_) -> false end, HooksData),
+  NewCmds = [{Recipient, Cmd} || {Recipient, {command, Cmd}} <- CmdAnsw],
+  NewState = State#state{commands = Cmds ++ NewCmds},
+  handle_hooks(T, Hook, Unhandled, NewState);
+
+handle_hooks([answer | T], terminal_raw_data, HooksData, State) ->
+  Splitted = list_split(fun({_, {answer, _}}) -> true; (_) -> false end, HooksData),
+  {Unhandled, NewState} = case Splitted of
+                            {[], HooksData1} -> {HooksData1, State};
+                            {[{Module, {answer, Answer}} | _], HooksData1} ->
+                              {HooksData1, State#state{answer = {Module, Answer}}}
+                          end,
+  handle_hooks(T, terminal_raw_data, Unhandled, NewState);
+
+handle_hooks([answer | T], Hook, Data, State) ->
+  handle_hooks(T, Hook, Data, State);
+
+handle_hooks([], _Hook, Answers, State) ->
   {Answers, State}.
 
-list_div(Fun, List) ->
-  list_div(Fun, List, [], []).
+list_split(Fun, List) ->
+  list_split(Fun, List, [], []).
 
-list_div(Fun, [E | List], Matched, NotMatched) ->
+list_split(Fun, [E | List], Matched, NotMatched) ->
   case Fun(E) of
-    true -> list_div(Fun, List, [E | Matched], NotMatched);
-    false ->list_div(Fun, List, Matched, [E | NotMatched])
+    true -> list_split(Fun, List, [E | Matched], NotMatched);
+    false ->list_split(Fun, List, Matched, [E | NotMatched])
   end;
-list_div(_, [], Matched, NotMatched) ->
+list_split(_, [], Matched, NotMatched) ->
   {lists:reverse(Matched), lists:reverse(NotMatched)}.
 
 return(#state{close = false} = State) ->
