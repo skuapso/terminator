@@ -342,8 +342,8 @@ handle_answer(#state{answer = {AnsModule, Answer}, module = Module, active = fal
     is_binary(Answer)
     orelse (AnsModule =:= Module)
     ->
-  BinAnswer = case is_binary(Answer) of
-                true -> Answer;
+  {ok, BinAnswer} = case is_binary(Answer) of
+                true -> {ok, Answer};
                 false -> Module:to_binary(answer, Answer)
               end,
   State1 = run_hook(terminal_answer, [terminal(State), AnsModule, BinAnswer], State),
