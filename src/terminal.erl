@@ -353,16 +353,14 @@ handle_answer(#state{answer = {AnsModule, Answer}, module = Module, active = fal
 
 handle_answer(#state{module = Module, answer = PrevAnswer} = State) ->
   '_debug'("getting answer from ~w, state ~w, prev answer is ~w", [Module, State, PrevAnswer]),
-  Answer = case Module:answer(State) of
-              {ok, A} -> {ok, A, State};
-              A -> A
-            end,
-  {ok, Answer1, State1} = case Answer of
-                           {ok, A1, State_} when is_binary(A1) ->
-                             {ok, {Module, A1}, State_};
-                           A1 -> A1
-                         end,
-  handle_answer(State1#state{answer = Answer1, active = false}).
+  {ok, Answer, NewState} = case Module:answer(State) of
+                             {ok, A} when not is_tuple(A) ->
+                               {ok, {Module, A}, State};
+                             {ok, A, #state{} = NState} when not is_tuple(A) ->
+                               {ok, {Module, A}, NState};
+                             A -> A
+                           end,
+  handle_answer(NewState#state{answer = Answer, active = false}).
 
 handle_incomplete(Data, State) ->
   '_debug'("incomplete ~w", [Data]),
