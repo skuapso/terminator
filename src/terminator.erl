@@ -11,7 +11,6 @@
 -export([add_terminal/3]).
 -export([terminal_command/4]).
 -export([delete_terminal/3]).
--export([init_terminator/3]).
 
 %% Application callbacks
 -export([start/0, start/2, stop/1]).
@@ -83,15 +82,6 @@ terminal_command(_Pid, Terminal, _RawData, _Timeout) ->
 delete_terminal(Pid, _Reason, _Timeout) ->
   ets:delete(?MODULE, Pid),
   ok.
-
-init_terminator(Module, Socket, Opts) ->
-  '_trace'("init ~w", [Module]),
-  proc_lib:init_ack({ok, self()}),
-  hooks:run(connection_accepted, [Module, Socket], 10000),
-  hooks:final(connection_closed),
-  ets:insert(?MODULE, {self(), undefined}),
-  process_flag(trap_exit, true),
-  Module:init({Socket, Opts}).
 
 %% ===================================================================
 %% Supervisor callbacks
