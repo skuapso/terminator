@@ -25,6 +25,7 @@
 -export([answer/1]).
 -export([timeout/1]).
 -export([active/1]).
+-export([proxy/1]).
 
 %% gen_server callbacks
 -export([init/1]).
@@ -48,6 +49,7 @@
                 out = 1400,
                 close = false,
                 commands = [],
+                proxy,
                 incomplete = <<>>}).
 
 -define(is_socket(T, Sock, Socket),
@@ -106,7 +108,10 @@ state(#state{state = IState}, Module) ->
   maps:get(Module, IState, #{}).
 
 answer(#state{answer = Answer}) -> Answer.
+
 active(#state{active = Active}) -> Active.
+
+proxy(#state{proxy = Proxy}) -> Proxy.
 
 set(State = #state{state = IState}, Module, Key, Val) ->
   MState = maps:get(Module, IState, #{}),
@@ -123,6 +128,7 @@ set(State = #state{}, socket, Socket) -> State#state{socket = Socket};
 set(State = #state{}, close,  Close)  -> State#state{close  = Close};
 set(State = #state{}, uin,    Uin)    -> State#state{uin    = Uin};
 set(State = #state{}, sockopts, Opts) -> State#state{sockopts = Opts};
+set(State = #state{}, proxy, Proxy)   -> State#state{proxy  = Proxy};
 set(State = #state{}, timeout,Timeout)-> State#state{timeout= Timeout};
 set(State = #state{}, active, Active) -> State#state{active = Active};
 set(State = #state{}, module, Module) -> State#state{module = Module};
@@ -179,9 +185,10 @@ handle_call(_Request, _From, State) ->
 %%--------------------------------------------------------------------
 handle_cast(accept, {Socket, {Module, Opts}}) ->
   '_trace'("accepting socket"),
-  {ok, State} = Module:init(Opts, #state{socket = Socket, module = Module}),
-  set_socket_opts(Socket, State),
-  return(State);
+  {ok, Unparsed, State} = parse_opts(Opts, [], #state{socket = Socket, module = Module}),
+  {ok, #state{sockopts = SockOpts} = State1} = Module:init(Unparsed, State),
+  setopts(Socket, SockOpts),
+  return(State1);
 handle_cast(_Msg, State) ->
   '_warning'("unhandled cast ~w", [_Msg]),
   return(State).
@@ -258,6 +265,10 @@ handle_info({tcp_closed, Sock}, #state{socket = Socket} = State)
   when ?is_socket(tcp, Sock, Socket) ->
   '_trace'("socket closed"),
   return(State#state{close = normal});
+handle_info({tcp_closed, Sock}, #state{proxy = Socket} = State)
+  when ?is_socket(tcp, Sock, Socket) ->
+  '_trace'("socket closed"),
+  return(State#state{close = normal});
 handle_info(timeout, State) ->
   '_trace'("timeout"),
   return(State#state{close = normal});
@@ -295,11 +306,18 @@ terminate(Reason, State) ->
 %%--------------------------------------------------------------------
 code_change(_OldVsn, State, _Extra) ->
   '_notice'("code change from ~w with extra ~w", [_OldVsn, _Extra]),
-  {ok, State, timeout(State)}.
+  return(State).
 
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+parse_opts([{proxy, Proxy} | Opts], Unparsed, State) ->
+  parse_opts(Opts, Unparsed, State#state{proxy = Proxy});
+parse_opts([Opt | Opts], Unparsed, State) ->
+  parse_opts(Opts, [Opt | Unparsed], State);
+parse_opts([], Unparsed, State) ->
+  {ok, lists:reverse(Unparsed), State}.
+
 merge_data(SockData, Incomplete, #state{in = In} = State) ->
   case is_binary(SockData) of
     true when byte_size(Incomplete) + byte_size(SockData) > In ->
@@ -314,18 +332,17 @@ set_control({tcp, Socket}, Pid) ->
   gen_tcp:controlling_process(Socket, Pid),
   gen_server:cast(Pid, accept).
 
-set_socket_opts({tcp, Socket}, #state{sockopts = Opts}) ->
-  inet:setopts(Socket, maps:to_list(Opts));
-set_socket_opts(_Socket, #state{module = Module} = State) ->
-  Module:setopts(State).
+setopts(Socket, Opts) when is_map(Opts) ->
+  setopts(Socket, maps:to_list(Opts));
+setopts({tcp, Socket}, Opts) ->
+  inet:setopts(Socket, Opts);
+setopts({Module, Socket}, Opts) ->
+  Module:setopts(Socket, Opts).
 
-send(Data, #state{socket = {tcp, Socket}} = State) when Data =/= <<>> ->
-  Result = gen_tcp:send(Socket, Data),
-  {Result, State};
-send(<<>>, #state{socket = {tcp, _Socket}} = State) ->
-  {ok, State};
-send(Data, #state{module = Module} = State) ->
-  Module:send(Data, State).
+send({tcp, Socket}, Data) ->
+  gen_tcp:send(Socket, Data);
+send({Module, Socket}, Data) ->
+  Module:send(Socket, Data).
 
 handle_parsed(<<>>, [Packet | Packets], State) ->
   '_trace'("packet ~w", [Packet]),
@@ -351,8 +368,11 @@ handle_parsed(RawData, Packets, #state{module = Module} = State)
 handle_parsed(<<>>, [], State) ->
   handle_answer(State).
 
-handle_answer(#state{answer = {AnsModule, Answer}, module = Module,
-                     active = false, commands = []} = State)
+handle_answer(#state{answer = {AnsModule, Answer},
+                     module = Module,
+                     socket = Socket,
+                     active = false,
+                     commands = []} = State)
   when
     is_binary(Answer)
     orelse (AnsModule =:= Module)
@@ -362,9 +382,8 @@ handle_answer(#state{answer = {AnsModule, Answer}, module = Module,
                       false -> Module:to_binary(answer, Answer)
                     end,
   State1 = run_hook(terminal_answer, [terminal(State), AnsModule, BinAnswer], State),
-  {ok, State2} = send(Answer, State1),
-  '_debug'("state after send ~w", [State2]),
-  State2#state{answer = undefined};
+  ok = send(Socket, Answer),
+  State1#state{answer = undefined};
 
 handle_answer(#state{module = Module, answer = PrevAnswer, commands = Cmds} = State) ->
   '_debug'("getting answer from ~w, state ~w, prev answer is ~w", [Module, State, PrevAnswer]),
@@ -397,32 +416,55 @@ set_uin(Uin, Data, #state{socket = Socket, module = Module} = State) ->
     {stop, _, NewState} -> NewState
   end.
 
-run_hook(Hook, Data, #state{module = Module} = State) ->
+run_hook(Hook, Data, #state{module = Module, proxy = Proxy} = State) ->
   HooksData = hooks:run(Hook, Data, timeout(State)),
-  {HooksData1, State1} = handle_hooks([commands, answer], Hook, HooksData, State),
+  HooksData1 = case {Hook, Proxy} of
+                 {terminal_raw_data, Proxy} when Proxy =/= undefined ->
+                   [_Terminal, RawData] = Data,
+                   setopts(Proxy, #{active => false}),
+                   send(Proxy, RawData),
+                   {ok, Answer} = recv(Proxy),
+                   setopts(Proxy, #{active => true}),
+                   [{proxy, {answer, Answer}} | HooksData];
+                 _ -> HooksData
+               end,
+  {HooksData2, State1} = handle_hooks([proxy, commands, answer], Hook, HooksData1, State),
   '_trace'("handling hooks for ~p in ~p", [Hook, Module]),
-  case Module:handle_hooks(Hook, Data, HooksData1, State1) of
+  case Module:handle_hooks(Hook, Data, HooksData2, State1) of
     ok -> State1;
     {ok, State2} -> State2
   end.
 
-handle_hooks([commands | T], Hook, HooksData, #state{commands = Cmds} = State) ->
-  {CmdAnsw, Unhandled} = list_split(fun({_, {command, _}}) -> true; (_) -> false end, HooksData),
-  NewCmds = [{Recipient, Cmd} || {Recipient, {command, Cmd}} <- CmdAnsw],
-  NewState = State#state{commands = Cmds ++ NewCmds},
-  handle_hooks(T, Hook, Unhandled, NewState);
-
-handle_hooks([answer | T], terminal_raw_data, HooksData, State) ->
+handle_hooks([answer | T], Hook, HooksData, State)
+  when Hook =:= terminal_raw_data ->
   Splitted = list_split(fun({_, {answer, _}}) -> true; (_) -> false end, HooksData),
   {Unhandled, NewState} = case Splitted of
                             {[], HooksData1} -> {HooksData1, State};
                             {[{Module, {answer, Answer}} | _], HooksData1} ->
                               {HooksData1, State#state{answer = {Module, Answer}}}
                           end,
-  handle_hooks(T, terminal_raw_data, Unhandled, NewState);
+  handle_hooks(T, Hook, Unhandled, NewState);
 
 handle_hooks([answer | T], Hook, Data, State) ->
   handle_hooks(T, Hook, Data, State);
+
+handle_hooks([proxy | T], Hook, HooksData, #state{proxy = Proxy} = State)
+  when Hook =:= terminal_raw_data andalso Proxy =/= undefined->
+  handle_hooks(T, Hook, HooksData, State);
+
+handle_hooks([proxy | T], Hook, HooksData, #state{proxy = Proxy} = State)
+  when Hook =:= terminal_uin andalso Proxy =/= undefined->
+  {ok, Socket} = connect(State),
+  handle_hooks(T, Hook, HooksData, State#state{proxy = Socket});
+
+handle_hooks([proxy | T], Hook, HooksData, State) ->
+  handle_hooks(T, Hook, HooksData, State);
+
+handle_hooks([commands | T], Hook, HooksData, #state{commands = Cmds} = State) ->
+  {CmdAnsw, Unhandled} = list_split(fun({_, {command, _}}) -> true; (_) -> false end, HooksData),
+  NewCmds = [{Recipient, Cmd} || {Recipient, {command, Cmd}} <- CmdAnsw],
+  NewState = State#state{commands = Cmds ++ NewCmds},
+  handle_hooks(T, Hook, Unhandled, NewState);
 
 handle_hooks([], _Hook, Answers, State) ->
   {Answers, State}.
@@ -447,5 +489,20 @@ return(#state{close = Reason} = State) when Reason =/= false ->
 return(Reply) ->
   '_warning'("self reply ~p", [Reply]),
   Reply.
+
+connect(#state{proxy = Proxy, socket = Socket, sockopts = SockOpts}) ->
+  Proto = element(1, Socket),
+  {ok, ProxySocket} = connect(Proto, Proxy, SockOpts),
+  {ok, {Proto, ProxySocket}}.
+
+connect(tcp, {Host, Port}, SockOpts) ->
+  gen_tcp:connect(Host, Port, maps:to_list(SockOpts));
+connect(Proto, {Host, Port}, SockOpts) ->
+  Proto:connect(Host, Port, maps:to_list(SockOpts)).
+
+recv({tcp, Socket}) ->
+  gen_tcp:recv(Socket, 0);
+recv({Module, Socket}) ->
+  Module:recv(Socket, 0).
 
 %% vim: ft=erlang
