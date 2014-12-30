@@ -291,9 +291,8 @@ handle_info(Info, #state{module = Module} = State) ->
 %%--------------------------------------------------------------------
 terminate({broken, Data, _Reason}, State) ->
   terminate({broken, Data}, State);
-terminate(Reason, State) ->
-  '_debug'("connection closed"),
-  run_hook(connection_closed, [Reason], State),
+terminate(Reason, _State) ->
+  '_warning'(Reason =/= normal, "connection closed ~p", [Reason], debug),
   ok.
 
 %%--------------------------------------------------------------------
@@ -346,7 +345,7 @@ send({Module, Socket}, Data) ->
 
 handle_parsed(<<>>, [Packet | Packets], State) ->
   '_trace'("packet ~w", [Packet]),
-  State1 = run_hook(terminal_packet, [terminal(State), Packet], State),
+  State1 = run_hook(packet, [terminal(State), Packet], State),
   handle_parsed(<<>>, Packets, State1);
 
 handle_parsed(RawData, Packets, State)
@@ -354,7 +353,7 @@ handle_parsed(RawData, Packets, State)
     RawData =/= <<>>
     andalso is_binary(RawData) ->
   '_trace'("raw ~w", [RawData]),
-  State1 = run_hook(terminal_raw_data, [terminal(State), RawData], State),
+  State1 = run_hook(raw_data, [terminal(State), RawData], State),
   '_trace'("handling packets ~w", [Packets]),
   handle_parsed(<<>>, Packets, State1);
 
@@ -381,7 +380,7 @@ handle_answer(#state{answer = {AnsModule, Answer},
                       true -> {ok, Answer};
                       false -> Module:to_binary(answer, Answer)
                     end,
-  State1 = run_hook(terminal_answer, [terminal(State), AnsModule, BinAnswer], State),
+  State1 = run_hook(answer, [terminal(State), AnsModule, BinAnswer], State),
   ok = send(Socket, Answer),
   State1#state{answer = undefined};
 
@@ -405,21 +404,21 @@ handle_incomplete(Data, State) ->
   '_debug'("incomplete ~w", [Data]),
   State#state{incomplete = Data}.
 
-set_uin(Uin, Data, #state{socket = Socket, module = Module} = State) ->
+set_uin(Uin, Data, #state{socket = {_, Socket}} = State) ->
   '_debug'("got uin ~w", [Uin]),
   State1 = State#state{uin = Uin},
-  State2 = run_hook(connection_accepted, [Module, element(2, Socket)], State1),
-  State3 = run_hook(terminal_uin, [terminal(State1)], State2),
-  '_trace'("handling data with state ~p", [State3]),
-  case handle_info(Data, State3) of
+  hooks:final({terminal, disconnected}),
+  State2 = run_hook(connected, [terminal(State1), Socket], State1),
+  '_trace'("handling data with state ~p", [State2]),
+  case handle_info(Data, State2) of
     {noreply, NewState, _} -> NewState;
     {stop, _, NewState} -> NewState
   end.
 
 run_hook(Hook, Data, #state{module = Module, proxy = Proxy} = State) ->
-  HooksData = hooks:run(Hook, Data, timeout(State)),
+  HooksData = hooks:run({?MODULE, Hook}, Data, timeout(State)),
   HooksData1 = case {Hook, Proxy} of
-                 {terminal_raw_data, Proxy} when Proxy =/= undefined ->
+                 {raw_data, Proxy} when Proxy =/= undefined ->
                    [_Terminal, RawData] = Data,
                    setopts(Proxy, #{active => false}),
                    send(Proxy, RawData),
@@ -436,7 +435,7 @@ run_hook(Hook, Data, #state{module = Module, proxy = Proxy} = State) ->
   end.
 
 handle_hooks([answer | T], Hook, HooksData, State)
-  when Hook =:= terminal_raw_data ->
+  when Hook =:= raw_data ->
   Splitted = list_split(fun({_, {answer, _}}) -> true; (_) -> false end, HooksData),
   {Unhandled, NewState} = case Splitted of
                             {[], HooksData1} -> {HooksData1, State};
@@ -449,7 +448,7 @@ handle_hooks([answer | T], Hook, Data, State) ->
   handle_hooks(T, Hook, Data, State);
 
 handle_hooks([proxy | T], Hook, HooksData, #state{proxy = Proxy} = State)
-  when Hook =:= terminal_raw_data andalso Proxy =/= undefined->
+  when Hook =:= raw_data andalso Proxy =/= undefined->
   handle_hooks(T, Hook, HooksData, State);
 
 handle_hooks([proxy | T], Hook, HooksData, #state{proxy = Proxy} = State)
