@@ -8,7 +8,7 @@
 -export([listen/1]).
 -export([accept/2]).
 -export([add_uin/2]).
--export([add_terminal/3]).
+-export([add_terminal/4]).
 -export([terminal_command/4]).
 -export([delete_terminal/3]).
 
@@ -59,7 +59,7 @@ start(_StartType, StartArgs) ->
 stop(_State) ->
   ok.
 
-add_terminal(Pid, Terminal, _Timeout) ->
+add_terminal(Pid, Terminal, _Socket, _Timeout) ->
   case ets:match(?MODULE, {'$1', Terminal}) of
     [] -> ok;
     L -> lists:map(fun(X) ->
@@ -89,9 +89,9 @@ delete_terminal(Pid, _Reason, _Timeout) ->
 init(Opts) ->
   ets:new(?MODULE, [set, public, named_table]),
   Weight = misc:get_env(?MODULE, weight, Opts),
-  hooks:install(terminal_uin, Weight, {?MODULE, add_terminal}),
-  hooks:install(terminal_raw_data, Weight, {?MODULE, terminal_command}),
-  hooks:install(connection_closed, Weight, {?MODULE, delete_terminal}),
+  hooks:install({terminal, connected}, Weight, {?MODULE, add_terminal}),
+  hooks:install({terminal, raw_data}, Weight, {?MODULE, terminal_command}),
+  hooks:install({terminal, disconnected}, Weight, {?MODULE, delete_terminal}),
   {ok,
     {
       {one_for_one, 5, 10},
