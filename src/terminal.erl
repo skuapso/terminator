@@ -59,8 +59,12 @@
 
 -define(is_answer(T),
         is_tuple(T)
+        andalso tuple_size(T) =:= 2
         andalso is_atom(element(1, T))
         andalso is_binary(element(2, T))
+       ).
+-define(internal_proto(T),
+        T =:= tcp orelse T =:= unauthorized
        ).
 
 -include_lib("logger/include/log.hrl").
@@ -82,7 +86,11 @@ behaviour_info(callbacks) ->
    {parse, 2},
    {answer, 1},
    {handle_hooks, 4},
-   {handle_info, 2}
+   {handle_info, 2},
+   {connect, 3},
+   {send, 2},
+   {recv, 2},
+   {setopts, 2}
   ].
 
 accept(Socket, Module) ->
@@ -265,8 +273,8 @@ handle_info({tcp_closed, Sock}, #state{socket = Socket} = State)
   when ?is_socket(tcp, Sock, Socket) ->
   '_trace'("socket closed"),
   return(State#state{close = normal});
-handle_info({tcp_closed, Sock}, #state{proxy = Socket} = State)
-  when ?is_socket(tcp, Sock, Socket) ->
+handle_info({tcp_closed, Sock}, #state{proxy = Proxy} = State)
+  when ?is_socket(tcp, Sock, Proxy) ->
   '_trace'("socket closed"),
   return(State#state{close = normal});
 handle_info(timeout, State) ->
@@ -333,12 +341,12 @@ set_control({tcp, Socket}, Pid) ->
 
 setopts(Socket, Opts) when is_map(Opts) ->
   setopts(Socket, maps:to_list(Opts));
-setopts({tcp, Socket}, Opts) ->
+setopts({Proto, Socket}, Opts) when ?internal_proto(Proto) ->
   inet:setopts(Socket, Opts);
 setopts({Module, Socket}, Opts) ->
   Module:setopts(Socket, Opts).
 
-send({tcp, Socket}, Data) ->
+send({Proto, Socket}, Data) when ?internal_proto(Proto) ->
   gen_tcp:send(Socket, Data);
 send({Module, Socket}, Data) ->
   Module:send(Socket, Data).
@@ -348,12 +356,41 @@ handle_parsed(<<>>, [Packet | Packets], State) ->
   State1 = run_hook(packet, [terminal(State), Packet], State),
   handle_parsed(<<>>, Packets, State1);
 
-handle_parsed(RawData, Packets, State)
+handle_parsed(RawData, Packets, #state{proxy = Proxy, socket = Socket} = State)
   when
     RawData =/= <<>>
     andalso is_binary(RawData) ->
   '_trace'("raw ~w", [RawData]),
-  State1 = run_hook(raw_data, [terminal(State), RawData], State),
+  %% logicaly sending to proxy should be in handle_hooks/4
+  %% but we need RawData and Packets which is unavailable in handle_hooks/4
+  %% also proxy should answer before any hook
+  ProxyData = case Proxy =/= undefined of
+                true
+                  when element(1, Proxy) =:= element(1, Socket)
+                       orelse element(1, Proxy) =:= unauthorized
+                       ->
+                  RawData;
+                true ->
+                  Module = element(1, Proxy),
+                  Repacked_ = [Module:pack(X) || X <- Packets],
+                  Repacked = [X || {ok, X} <- Repacked_],
+                  Module:prepare(terminal(State), Repacked);
+                 _ ->
+                    <<>>
+               end,
+  HooksData = case ProxyData of
+                <<>> -> [];
+                _ ->
+                   {ok, Answer} = proxy_send(Proxy, ProxyData),
+                   case element(1, Proxy) =:= unauthorized of
+                     true ->
+                       [];
+                     false when element(1, Proxy) =/= element(1, Socket) ->
+                       [];
+                     false -> [{proxy, {answer, Answer}}]
+                   end
+              end,
+  State1 = run_hook(raw_data, [terminal(State), RawData], HooksData, State),
   '_trace'("handling packets ~w", [Packets]),
   handle_parsed(<<>>, Packets, State1);
 
@@ -392,8 +429,12 @@ handle_answer(#state{module = Module, answer = PrevAnswer, commands = Cmds} = St
                                {ok, {Module, A}, State};
                              {ok, A, #state{} = NState} when not (?is_answer(A)) ->
                                {ok, {Module, A}, NState};
-                             A -> A
+                             {ok, A} ->
+                               {ok, A, State};
+                             A ->
+                               A
                            end,
+  '_debug'("answer is ~p", [Answer]),
   #state{commands = NewCmds} = NewState,
   RunnedCmds = Cmds -- NewCmds,
   [hooks:run({Rec, set}, [terminal, command_exec, {terminal(NewState), Id}], timeout(NewState)) ||
@@ -415,21 +456,15 @@ set_uin(Uin, Data, #state{socket = {_, Socket}} = State) ->
     {stop, _, NewState} -> NewState
   end.
 
-run_hook(Hook, Data, #state{module = Module, proxy = Proxy} = State) ->
-  HooksData = hooks:run({?MODULE, Hook}, Data, timeout(State)),
-  HooksData1 = case {Hook, Proxy} of
-                 {raw_data, Proxy} when Proxy =/= undefined ->
-                   [_Terminal, RawData] = Data,
-                   setopts(Proxy, #{active => false}),
-                   send(Proxy, RawData),
-                   {ok, Answer} = recv(Proxy),
-                   setopts(Proxy, #{active => true}),
-                   [{proxy, {answer, Answer}} | HooksData];
-                 _ -> HooksData
-               end,
-  {HooksData2, State1} = handle_hooks([proxy, commands, answer], Hook, HooksData1, State),
+run_hook(Hook, Data, State) ->
+  run_hook(Hook, Data, [], State).
+
+run_hook(Hook, Data, HooksData, #state{module = Module} = State) ->
+  HooksData1 = hooks:run({?MODULE, Hook}, Data, timeout(State)),
+  HooksData2 = HooksData ++ HooksData1,
+  {HooksData3, State1} = handle_hooks([proxy, commands, answer], Hook, HooksData2, State),
   '_trace'("handling hooks for ~p in ~p", [Hook, Module]),
-  case Module:handle_hooks(Hook, Data, HooksData2, State1) of
+  case Module:handle_hooks(Hook, Data, HooksData3, State1) of
     ok -> State1;
     {ok, State2} -> State2
   end.
@@ -444,26 +479,33 @@ handle_hooks([answer | T], Hook, HooksData, State)
                           end,
   handle_hooks(T, Hook, Unhandled, NewState);
 
-handle_hooks([answer | T], Hook, Data, State) ->
-  handle_hooks(T, Hook, Data, State);
-
-handle_hooks([proxy | T], Hook, HooksData, #state{proxy = Proxy} = State)
-  when Hook =:= raw_data andalso Proxy =/= undefined->
-  handle_hooks(T, Hook, HooksData, State);
-
-handle_hooks([proxy | T], Hook, HooksData, #state{proxy = Proxy} = State)
-  when Hook =:= terminal_uin andalso Proxy =/= undefined->
-  {ok, Socket} = connect(State),
-  handle_hooks(T, Hook, HooksData, State#state{proxy = Socket});
-
-handle_hooks([proxy | T], Hook, HooksData, State) ->
-  handle_hooks(T, Hook, HooksData, State);
+handle_hooks([proxy | T], Hook, HooksData, #state{proxy = Proxy, socket = Socket} = State)
+  when Hook =:= connected andalso Proxy =/= undefined->
+  {ok, ProxySocket} = connect(State),
+  ProxyProto = element(1, ProxySocket),
+  case ProxyProto =:= unauthorized orelse ProxyProto =:= element(1, Socket) of
+    true ->
+      % in this case terminal will send authorization info
+      % and we will send it in handle_parsed/3
+      ok;
+    false ->
+      AuthData = case catch ProxyProto:auth(terminal(State)) of
+                   {'EXIT', _} -> <<>>;
+                   AuthData_ -> AuthData_
+                 end,
+      proxy_send(ProxySocket, AuthData),
+      ok
+  end,
+  handle_hooks(T, Hook, HooksData, State#state{proxy = ProxySocket});
 
 handle_hooks([commands | T], Hook, HooksData, #state{commands = Cmds} = State) ->
   {CmdAnsw, Unhandled} = list_split(fun({_, {command, _}}) -> true; (_) -> false end, HooksData),
   NewCmds = [{Recipient, Cmd} || {Recipient, {command, Cmd}} <- CmdAnsw],
   NewState = State#state{commands = Cmds ++ NewCmds},
   handle_hooks(T, Hook, Unhandled, NewState);
+
+handle_hooks([_ | T], Hook, Answers, State) ->
+  handle_hooks(T, Hook, Answers, State);
 
 handle_hooks([], _Hook, Answers, State) ->
   {Answers, State}.
@@ -490,18 +532,33 @@ return(Reply) ->
   Reply.
 
 connect(#state{proxy = Proxy, socket = Socket, sockopts = SockOpts}) ->
-  Proto = element(1, Socket),
-  {ok, ProxySocket} = connect(Proto, Proxy, SockOpts),
-  {ok, {Proto, ProxySocket}}.
+  {Proto, Host, Port} = case Proxy of
+                          {Proto1, {Host1, Port1}} ->
+                            {Proto1, Host1, Port1};
+                          {Host1, Port1} ->
+                            {element(1, Socket), Host1, Port1};
+                          _ -> Proxy
+                        end,
+  connect(Proto, Host, Port, SockOpts).
 
-connect(tcp, {Host, Port}, SockOpts) ->
-  gen_tcp:connect(Host, Port, maps:to_list(SockOpts));
-connect(Proto, {Host, Port}, SockOpts) ->
-  Proto:connect(Host, Port, maps:to_list(SockOpts)).
+connect(Proto, Host, Port, SockOpts)
+  when ?internal_proto(Proto) ->
+  {ok, Socket} = gen_tcp:connect(Host, Port, maps:to_list(SockOpts)),
+  {ok, {Proto, Socket}};
+connect(Proto, Host, Port, SockOpts) ->
+  {ok, Socket} = Proto:connect(Host, Port, maps:to_list(SockOpts)),
+  {ok, {Proto, Socket}}.
 
-recv({tcp, Socket}) ->
+recv({Proto, Socket}) when ?internal_proto(Proto) ->
   gen_tcp:recv(Socket, 0);
 recv({Module, Socket}) ->
   Module:recv(Socket, 0).
+
+proxy_send(Proxy, Data) ->
+  setopts(Proxy, #{active => false}),
+  send(Proxy, Data),
+  {ok, Answer} = recv(Proxy),
+  setopts(Proxy, #{active => true}),
+  {ok, Answer}.
 
 %% vim: ft=erlang
