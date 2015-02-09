@@ -481,7 +481,8 @@ handle_hooks([answer | T], Hook, HooksData, State)
 
 handle_hooks([proxy | T], Hook, HooksData, #state{proxy = Proxy, socket = Socket} = State)
   when Hook =:= connected andalso Proxy =/= undefined->
-  {ok, ProxySocket} = connect(State),
+  {ok, NewState} = connect(State),
+  #state{proxy = ProxySocket} = NewState,
   ProxyProto = element(1, ProxySocket),
   case ProxyProto =:= unauthorized orelse ProxyProto =:= element(1, Socket) of
     true ->
@@ -489,14 +490,14 @@ handle_hooks([proxy | T], Hook, HooksData, #state{proxy = Proxy, socket = Socket
       % and we will send it in handle_parsed/3
       ok;
     false ->
-      AuthData = case catch ProxyProto:auth(terminal(State)) of
+      AuthData = case catch ProxyProto:auth(terminal(NewState)) of
                    {'EXIT', _} -> <<>>;
                    AuthData_ -> AuthData_
                  end,
       proxy_send(ProxySocket, AuthData),
       ok
   end,
-  handle_hooks(T, Hook, HooksData, State#state{proxy = ProxySocket});
+  handle_hooks(T, Hook, HooksData, NewState#state{proxy = ProxySocket});
 
 handle_hooks([commands | T], Hook, HooksData, #state{commands = Cmds} = State) ->
   {CmdAnsw, Unhandled} = list_split(fun({_, {command, _}}) -> true; (_) -> false end, HooksData),
@@ -531,29 +532,43 @@ return(Reply) ->
   '_warning'("self reply ~p", [Reply]),
   Reply.
 
-connect(#state{proxy = Proxy, socket = Socket, sockopts = SockOpts}) ->
-  {Proto, Host, Port} = case Proxy of
-                          {Proto1, {Host1, Port1}} ->
-                            {Proto1, Host1, Port1};
-                          {Host1, Port1} ->
-                            {element(1, Socket), Host1, Port1};
-                          _ -> Proxy
-                        end,
-  connect(Proto, Host, Port, SockOpts).
+connect(#state{proxy = Proxy, socket = Socket, sockopts = SockOpts} = State) ->
+  {Proto, Host, Port, Opts} = case Proxy of
+                                {Proto1, {Host1, Port1}} ->
+                                  {Proto1, Host1, Port1, []};
+                                {Host1, Port1} ->
+                                  {element(1, Socket), Host1, Port1, []};
+                                {Proto1, {Host1, Port1}, Opts1} ->
+                                  {Proto1, Host1, Port1, Opts1};
+                                {Proto1, Host1, Port1} when is_atom(Proto1) ->
+                                  {Proto1, Host1, Port1, []};
+                                {Host1, Port1, Opts1} ->
+                                  {element(1, Socket), Host1, Port1, Opts1};
+                                _ -> Proxy
+                              end,
+  Proto2 = case Proto of
+             json -> sk_json;
+             _ -> Proto
+           end,
+  connect(Proto2, Host, Port, SockOpts, Opts, State).
 
-connect(Proto, Host, Port, SockOpts)
-  when ?internal_proto(Proto) ->
-  {ok, Socket} = gen_tcp:connect(Host, Port, maps:to_list(SockOpts)),
-  {ok, {Proto, Socket}};
-connect(Proto, Host, Port, SockOpts) ->
-  {ok, Socket} = Proto:connect(Host, Port, maps:to_list(SockOpts)),
-  {ok, {Proto, Socket}}.
+connect(Proto, Host, Port, SockOpts, Opts, State) ->
+  {ok, Socket} = case ?internal_proto(Proto) of
+                   true ->
+                     gen_tcp:connect(Host, Port, maps:to_list(SockOpts));
+                   false ->
+                     Proto:connect(Host, Port, maps:to_list(SockOpts))
+                 end,
+  setopts({Proto, Socket}, Opts),
+  {ok, State#state{proxy = {Proto, Socket}}}.
 
 recv({Proto, Socket}) when ?internal_proto(Proto) ->
   gen_tcp:recv(Socket, 0);
 recv({Module, Socket}) ->
   Module:recv(Socket, 0).
 
+proxy_send(_, <<>>) ->
+  {ok, <<>>};
 proxy_send(Proxy, Data) ->
   setopts(Proxy, #{active => false}),
   send(Proxy, Data),
