@@ -25,8 +25,8 @@ send(Socket, Data) ->
 recv(Socket, Size) ->
   gen_tcp:recv(Socket, Size).
 
-setopts(Socket, [{uri, Uri} | T]) ->
-  hooks:set({?MODULE, uri}, Uri),
+setopts(Socket, [{path, Uri} | T]) ->
+  hooks:set({?MODULE, path}, Uri),
   setopts(Socket, T);
 setopts(Socket, [{headers, Headers} | T]) ->
   hooks:set({?MODULE, headers}, Headers),
@@ -46,7 +46,7 @@ pack(Packet) ->
 prepare({Proto, Uin}, Packets) ->
   PacketsWithTerminal = [X#{proto => Proto, uin => Uin} || X <- Packets],
   JsonedPackets = misc:to_json(PacketsWithTerminal),
-  Uri = hooks:get({?MODULE, uri}),
+  Path = hooks:get({?MODULE, path}),
   Headers = case hooks:get({?MODULE, headers}) of
               undefined -> <<>>;
               Headers_ -> Headers_
@@ -54,11 +54,13 @@ prepare({Proto, Uin}, Packets) ->
   PostData = <<"packets=", JsonedPackets/binary>>,
   Len = integer_to_binary(byte_size(PostData)),
   iolist_to_binary([
-                    "POST ", Uri, " HTTP/1.1\r\n",
+                    "POST ", Path, " HTTP/1.1\r\n",
                     "Connection: keep-alive\r\n",
                     "Content-Length: ", Len, "\r\n",
+                    "Content-Type: application/json\r\n",
                     Headers,
-                    "\r\n", PostData
+                    "\r\n\r\n",
+                    PostData
                    ]).
 
 %%%===================================================================
