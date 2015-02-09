@@ -30,12 +30,16 @@ add_uin(Parsed, UIN) ->
       [{navigation, [{uin, UIN} | N]} | proplists:delete(navigation, Parsed)]
   end.
 
-listen({Type, Module, Port}) ->
-  listen({Type, Module, Port, []});
-listen({Type, Module, Port, Opts}) ->
+listen(X) ->
+  listen(X, []).
+
+listen({Type, Module, Port}, Opts) ->
+  listen({Type, Module, Port, Opts});
+listen({Type, Module, Port, LOpts}, CommOpts) ->
+  Opts = LOpts ++ CommOpts,
   Ip = proplists:get_value(ip, Opts, {0, 0, 0, 0}),
-  listen({Type, Module, Port, Ip, proplists:delete(ip, Opts)});
-listen(Opts) when tuple_size(Opts) =:= 5 ->
+  listen({Type, Module, Port, Ip, proplists:delete(ip, Opts)}, []);
+listen(Opts, _) when tuple_size(Opts) =:= 5 ->
   Terminator = terminator(element(1, Opts)),
   supervisor:start_child(?MODULE, listener(Terminator, Opts)).
 
@@ -45,8 +49,9 @@ accept(Socket, Module) ->
 start_link(Opts) ->
   Reply = supervisor:start_link({local, ?MODULE}, ?MODULE, Opts),
   Listen = misc:get_env(?MODULE, listen, Opts),
+  CommonOpts = misc:get_env(?MODULE, options, Opts),
   lists:map(fun(X) ->
-        listen(X)
+        listen(X, CommonOpts)
     end, Listen),
   Reply.
 

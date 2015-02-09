@@ -12,6 +12,7 @@
   {mod, {terminator, []}},
   {env, [
     {listen, []},
+    {options, []},
     {weight, -1}
   ]}
  ]}.
