@@ -23,7 +23,19 @@ send(Socket, Data) ->
   gen_tcp:send(Socket, Data).
 
 recv(Socket, Size) ->
-  gen_tcp:recv(Socket, Size).
+  recv(Socket, Size, <<>>).
+
+recv(Socket, Size, RecvData) ->
+  {ok, TcpData} = gen_tcp:recv(Socket, Size),
+  Data = <<RecvData/binary, TcpData/binary>>,
+  Code = case erlang:decode_packet(http, Data, []) of
+           {more, _} ->
+             recv(Socket, Size, Data);
+           {ok, {http_response, _, Code_, _}, _} ->
+             Code_
+         end,
+  2 = Code div 100,
+  {ok, integer_to_binary(Code)}.
 
 setopts(Socket, [{path, Uri} | T]) ->
   hooks:set({?MODULE, path}, Uri),
@@ -51,8 +63,7 @@ prepare({Proto, Uin}, Packets) ->
               undefined -> <<>>;
               Headers_ -> Headers_
             end,
-  PostData = <<"packets=", JsonedPackets/binary>>,
-  Len = integer_to_binary(byte_size(PostData)),
+  Len = integer_to_binary(byte_size(JsonedPackets)),
   iolist_to_binary([
                     "POST ", Path, " HTTP/1.1\r\n",
                     "Connection: keep-alive\r\n",
@@ -60,7 +71,7 @@ prepare({Proto, Uin}, Packets) ->
                     "Content-Type: application/json\r\n",
                     Headers,
                     "\r\n\r\n",
-                    PostData
+                    JsonedPackets
                    ]).
 
 %%%===================================================================
