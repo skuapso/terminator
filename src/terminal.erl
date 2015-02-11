@@ -356,7 +356,7 @@ handle_parsed(<<>>, [Packet | Packets], State) ->
   State1 = run_hook(packet, [terminal(State), Packet], State),
   handle_parsed(<<>>, Packets, State1);
 
-handle_parsed(RawData, Packets, #state{proxy = Proxy, socket = Socket} = State)
+handle_parsed(RawData, Packets, #state{proxy = Proxy, socket = Socket, module = Module} = State)
   when
     RawData =/= <<>>
     andalso is_binary(RawData) ->
@@ -366,15 +366,15 @@ handle_parsed(RawData, Packets, #state{proxy = Proxy, socket = Socket} = State)
   %% also proxy should answer before any hook
   ProxyData = case Proxy =/= undefined of
                 true
-                  when element(1, Proxy) =:= element(1, Socket)
-                       orelse element(1, Proxy) =:= unauthorized
+                  when element(1, Proxy) =:= unauthorized
+                       orelse element(1, Proxy) =:= Module
                        ->
                   RawData;
                 true ->
-                  Module = element(1, Proxy),
-                  Repacked_ = [Module:pack(X) || X <- Packets],
+                  ProxyModule = element(1, Proxy),
+                  Repacked_ = [ProxyModule:pack(X) || X <- Packets],
                   Repacked = [X || {ok, X} <- Repacked_],
-                  Module:prepare(terminal(State), Repacked);
+                  ProxyModule:prepare(terminal(State), Repacked);
                  _ ->
                     <<>>
                end,
@@ -479,12 +479,12 @@ handle_hooks([answer | T], Hook, HooksData, State)
                           end,
   handle_hooks(T, Hook, Unhandled, NewState);
 
-handle_hooks([proxy | T], Hook, HooksData, #state{proxy = Proxy, socket = Socket} = State)
+handle_hooks([proxy | T], Hook, HooksData, #state{proxy = Proxy, module = Module} = State)
   when Hook =:= connected andalso Proxy =/= undefined->
   {ok, NewState} = connect(State),
   #state{proxy = ProxySocket} = NewState,
   ProxyProto = element(1, ProxySocket),
-  case ProxyProto =:= unauthorized orelse ProxyProto =:= element(1, Socket) of
+  case ProxyProto =:= unauthorized orelse ProxyProto =:= Module of
     true ->
       % in this case terminal will send authorization info
       % and we will send it in handle_parsed/3
