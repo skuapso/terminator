@@ -421,6 +421,8 @@ handle_answer(#state{answer = {AnsModule, Answer},
   ok = send(Socket, Answer),
   State1#state{answer = undefined};
 
+handle_answer(#state{uin = skip} = State) ->
+  handle_answer(State#state{uin = undefined});
 handle_answer(#state{module = Module, answer = PrevAnswer, commands = Cmds} = State) ->
   '_debug'("getting answer from ~w, state ~w, prev answer is ~w", [Module, State, PrevAnswer]),
   {ok, Answer, NewState} = case Module:answer(State) of
